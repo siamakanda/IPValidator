@@ -17,15 +17,30 @@ def fetch_dialer_data():
         response.raise_for_status()
 
         dialer_data = response.json()
-        print(f"Success! Retrieved {len(dialer_data)} dialer configurations.\n")
-
-        # --- THIS IS THE PART WE MODIFIED ---
-        # Return the data so validator.py can read it
-        return dialer_data
+        
+        # --- VALIDATION: ensure it's a list and each item has required fields ---
+        if not isinstance(dialer_data, list):
+            print(f"[-] API did not return a list. Got {type(dialer_data)}. Aborting.")
+            return []
+        
+        required_keys = {"dialer_url", "admin_username", "admin_password"}
+        valid_dialers = []
+        for idx, dialer in enumerate(dialer_data):
+            if not isinstance(dialer, dict):
+                print(f"[-] Item {idx} is not a dictionary, skipping.")
+                continue
+            missing = required_keys - dialer.keys()
+            if missing:
+                print(f"[-] Dialer {idx} missing keys {missing}, skipping.")
+                continue
+            valid_dialers.append(dialer)
+        
+        print(f"Success! Retrieved {len(valid_dialers)} valid dialer configurations out of {len(dialer_data)} total.")
+        return valid_dialers
 
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
-        return []  # Return an empty list if it fails
+        return []
 
 
 if __name__ == "__main__":
