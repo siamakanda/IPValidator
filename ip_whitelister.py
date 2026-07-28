@@ -1,5 +1,8 @@
+import json
+import os
 import sys
 import time
+from datetime import datetime
 from urllib.parse import urlparse, urlunparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
@@ -17,43 +20,80 @@ HEADERS = {
     "Referer": "https://clientdialer.callengine.org/",
 }
 MAX_WORKERS = 12
-REQUEST_TIMEOUT = 15
+CONNECT_TIMEOUT = 5
+READ_TIMEOUT = 15
 RETRY_TRIES = 2
 RETRY_DELAY = 1
+CACHE_FILE = os.path.join(
+    os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__)),
+    "dialer_cache.json"
+)
 # =================================================
 
 
+def save_cache(dialers):
+    """Save dialer data to local JSON cache."""
+    data = {"saved_at": datetime.now().isoformat(), "dialers": dialers}
+    with open(CACHE_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_cache():
+    """Load dialer data from local JSON cache, or return None on failure."""
+    if not os.path.exists(CACHE_FILE):
+        return None
+    try:
+        with open(CACHE_FILE, "r") as f:
+            data = json.load(f)
+        dialers = data.get("dialers", [])
+        saved_at = data.get("saved_at", "unknown")
+        print(f"[!] Loaded {len(dialers)} dialers from cache (saved: {saved_at}).")
+        return dialers
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"[-] Cache file corrupt or unreadable: {e}")
+        return None
+
+
+def validate_dialer_list(dialer_data):
+    """Filter and validate dialer entries from raw API data."""
+    if not isinstance(dialer_data, list):
+        print(f"[-] API did not return a list. Got {type(dialer_data)}. Aborting.")
+        return []
+    required_keys = {"dialer_url", "admin_username", "admin_password"}
+    valid_dialers = []
+    for idx, dialer in enumerate(dialer_data):
+        if not isinstance(dialer, dict):
+            print(f"[-] Item {idx} is not a dictionary, skipping.")
+            continue
+        missing = required_keys - dialer.keys()
+        if missing:
+            print(f"[-] Dialer {idx} missing keys {missing}, skipping.")
+            continue
+        valid_dialers.append(dialer)
+    return valid_dialers
+
+
 def fetch_dialer_data():
-    """Fetch and validate dialer configurations from API."""
+    """Fetch and validate dialer configurations from API, with cache fallback."""
     try:
         print(f"Sending GET request to {API_URL}...")
-        # IMPORTANT: verify=False disables SSL certificate checking
-        response = requests.get(API_URL, headers=HEADERS, timeout=10, verify=False)
+        response = retry_request(requests.get, API_URL, headers=HEADERS, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         response.raise_for_status()
 
         dialer_data = response.json()
+        valid_dialers = validate_dialer_list(dialer_data)
 
-        if not isinstance(dialer_data, list):
-            print(f"[-] API did not return a list. Got {type(dialer_data)}. Aborting.")
-            return []
-
-        required_keys = {"dialer_url", "admin_username", "admin_password"}
-        valid_dialers = []
-        for idx, dialer in enumerate(dialer_data):
-            if not isinstance(dialer, dict):
-                print(f"[-] Item {idx} is not a dictionary, skipping.")
-                continue
-            missing = required_keys - dialer.keys()
-            if missing:
-                print(f"[-] Dialer {idx} missing keys {missing}, skipping.")
-                continue
-            valid_dialers.append(dialer)
-
-        print(f"Success! Retrieved {len(valid_dialers)} valid dialer configurations out of {len(dialer_data)} total.")
+        if valid_dialers:
+            save_cache(valid_dialers)
+            print(f"Success! Retrieved {len(valid_dialers)} valid dialer configurations out of {len(dialer_data)} total.")
         return valid_dialers
 
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"[-] API request failed: {e}")
+        cached = load_cache()
+        if cached:
+            return cached
+        print("[-] No cache available. Aborting.")
         return []
 
 
@@ -72,9 +112,16 @@ def build_validation_url(dialer_url: str) -> str:
     return urlunparse(parsed) + validation_path
 
 
+def is_retryable(exception):
+    """Check if an exception is worth retrying (transient) vs permanent."""
+    err_str = str(exception).lower()
+    if any(kw in err_str for kw in ("namesresolutionerror", "name or service not known", "getaddrinfo failed", "sslerror", "tlsv1")):
+        return False
+    return True
+
+
 def retry_request(func, *args, **kwargs):
     """Simple retry decorator for network calls."""
-    # Force verify=False for all requests
     kwargs['verify'] = False
     last_exception = None
     for attempt in range(RETRY_TRIES + 1):
@@ -82,6 +129,8 @@ def retry_request(func, *args, **kwargs):
             return func(*args, **kwargs)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             last_exception = e
+            if not is_retryable(e):
+                raise
             if attempt < RETRY_TRIES:
                 time.sleep(RETRY_DELAY)
                 continue
@@ -100,7 +149,7 @@ def validate_ip_on_server(dialer_url, username, password, name):
         session.verify = False  # Disable SSL verification for this session
 
         try:
-            get_response = retry_request(session.get, validation_url, timeout=REQUEST_TIMEOUT)
+            get_response = retry_request(session.get, validation_url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             get_response.raise_for_status()
 
             soup = BeautifulSoup(get_response.text, "html.parser")
@@ -122,7 +171,7 @@ def validate_ip_on_server(dialer_url, username, password, name):
                 "submit": "Submit",
             }
 
-            post_response = retry_request(session.post, validation_url, data=payload, timeout=REQUEST_TIMEOUT)
+            post_response = retry_request(session.post, validation_url, data=payload, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
 
             if "Login Validated" in post_response.text or "Redirecting" in post_response.text:
                 return f"[+] {name}: Successfully whitelisted!"
@@ -141,7 +190,6 @@ def main():
     dialers = fetch_dialer_data()
     if not dialers:
         print("[-] No valid dialer data collected. Exiting.")
-        input("Press Enter to exit...")
         return
 
     print(f"[*] Starting parallel IP validation across {len(dialers)} hosts using {MAX_WORKERS} threads...\n")
@@ -159,21 +207,23 @@ def main():
             future = executor.submit(validate_ip_on_server, url, user, pwd, name)
             futures[future] = name
 
+        total = len(futures)
         for future in as_completed(futures):
             result_message = future.result()
-            print(result_message)
+            progress = success_count + fail_count + 1
+            print(f"[{progress}/{total}] {result_message}")
             if "[+]" in result_message:
                 success_count += 1
             else:
                 fail_count += 1
 
     print(f"\n[+] Validation loop complete. Success: {success_count} | Failed/Skipped: {fail_count}")
-    input("Press Enter to exit...")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n[-] Process interrupted by user. Exiting safely.")
-        sys.exit(0)
+        print("\n[-] Process interrupted by user.")
+    finally:
+        input("\nPress Enter to exit...")

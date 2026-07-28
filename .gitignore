@@ -1,2 +1,5 @@
 __pycache__
 .env
+dialer_cache.json
+*.spec
+build/
